@@ -3,7 +3,7 @@ package list
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 
@@ -13,9 +13,9 @@ import (
 )
 
 type deployKey struct {
-	ID        int
-	Key       string
-	Title     string
+	ID        int       `json:"id"`
+	Key       string    `json:"key"`
+	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
 	ReadOnly  bool      `json:"read_only"`
 }
@@ -38,7 +38,7 @@ func repoKeys(httpClient *http.Client, repo ghrepo.Interface) ([]deployKey, erro
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

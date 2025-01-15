@@ -2,18 +2,18 @@ package codespace
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"time"
 
 	"github.com/cli/cli/v2/internal/codespaces/api"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
 )
 
 type editOptions struct {
-	codespaceName string
-	displayName   string
-	idleTimeout   time.Duration
-	machine       string
+	selector    *CodespaceSelector
+	displayName string
+	machine     string
 }
 
 func newEditCmd(app *App) *cobra.Command {
@@ -24,38 +24,43 @@ func newEditCmd(app *App) *cobra.Command {
 		Short: "Edit a codespace",
 		Args:  noArgsConstraint,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.displayName == "" && opts.machine == "" {
+				return cmdutil.FlagErrorf("must provide `--display-name` or `--machine`")
+			}
+
 			return app.Edit(cmd.Context(), opts)
 		},
 	}
 
-	editCmd.Flags().StringVarP(&opts.codespaceName, "codespace", "c", "", "Name of the codespace")
-	editCmd.Flags().StringVarP(&opts.displayName, "displayName", "d", "", "display name")
-	editCmd.Flags().DurationVar(&opts.idleTimeout, "idle-timeout", 0, "allowed inactivity before codespace is stopped, e.g. \"10m\", \"1h\"")
-	editCmd.Flags().StringVarP(&opts.machine, "machine", "m", "", "hardware specifications for the VM")
+	opts.selector = AddCodespaceSelector(editCmd, app.apiClient)
+	editCmd.Flags().StringVarP(&opts.displayName, "display-name", "d", "", "Set the display name")
+	editCmd.Flags().StringVar(&opts.displayName, "displayName", "", "display name")
+	if err := editCmd.Flags().MarkDeprecated("displayName", "use `--display-name` instead"); err != nil {
+		fmt.Fprintf(app.io.ErrOut, "error marking flag as deprecated: %v\n", err)
+	}
+	editCmd.Flags().StringVarP(&opts.machine, "machine", "m", "", "Set hardware specifications for the VM")
 
 	return editCmd
 }
 
 // Edits a codespace
 func (a *App) Edit(ctx context.Context, opts editOptions) error {
-	userInputs := struct {
-		CodespaceName string
-		DisplayName   string
-		IdleTimeout   time.Duration
-		SKU           string
-	}{
-		CodespaceName: opts.codespaceName,
-		DisplayName:   opts.displayName,
-		IdleTimeout:   opts.idleTimeout,
-		SKU:           opts.machine,
+	codespaceName, err := opts.selector.SelectName(ctx)
+	if err != nil {
+		// TODO: is there a cleaner way to do this?
+		if errors.Is(err, errNoCodespaces) || errors.Is(err, errNoFilteredCodespaces) {
+			return err
+		}
+		return fmt.Errorf("error choosing codespace: %w", err)
 	}
-	a.StartProgressIndicatorWithLabel("Editing codespace")
-	_, err := a.apiClient.EditCodespace(ctx, userInputs.CodespaceName, &api.EditCodespaceParams{
-		DisplayName:        userInputs.DisplayName,
-		IdleTimeoutMinutes: int(userInputs.IdleTimeout.Minutes()),
-		Machine:            userInputs.SKU,
+
+	err = a.RunWithProgress("Editing codespace", func() (err error) {
+		_, err = a.apiClient.EditCodespace(ctx, codespaceName, &api.EditCodespaceParams{
+			DisplayName: opts.displayName,
+			Machine:     opts.machine,
+		})
+		return
 	})
-	a.StopProgressIndicator()
 	if err != nil {
 		return fmt.Errorf("error editing codespace: %w", err)
 	}

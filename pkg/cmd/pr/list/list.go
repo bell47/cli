@@ -5,27 +5,25 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/browser"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/tableprinter"
+	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/text"
-	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
-
-type browser interface {
-	Browse(string) error
-}
 
 type ListOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
-	Browser    browser
+	Browser    browser.Browser
 
 	WebMode      bool
 	LimitResults int
@@ -36,10 +34,11 @@ type ListOptions struct {
 	HeadBranch string
 	Labels     []string
 	Author     string
-	AppAuthor  string
 	Assignee   string
 	Search     string
-	Draft      string
+	Draft      *bool
+
+	Now func() time.Time
 }
 
 func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Command {
@@ -47,9 +46,10 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
 		Browser:    f.Browser,
+		Now:        time.Now,
 	}
 
-	var draft bool
+	var appAuthor string
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -72,7 +72,7 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 
 			Find a PR that introduced a given commit
 			$ gh pr list --search "<SHA>" --state merged
-    	`),
+		`),
 		Aliases: []string{"ls"},
 		Args:    cmdutil.NoArgsQuoteReminder,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -83,16 +83,12 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 				return cmdutil.FlagErrorf("invalid value for --limit: %v", opts.LimitResults)
 			}
 
-			if cmd.Flags().Changed("draft") {
-				opts.Draft = strconv.FormatBool(draft)
+			if cmd.Flags().Changed("author") && cmd.Flags().Changed("app") {
+				return cmdutil.FlagErrorf("specify only `--author` or `--app`")
 			}
 
-			if err := cmdutil.MutuallyExclusive(
-				"specify only `--author` or `--app`",
-				opts.Author != "",
-				opts.AppAuthor != "",
-			); err != nil {
-				return err
+			if cmd.Flags().Changed("app") {
+				opts.Author = fmt.Sprintf("app/%s", appAuthor)
 			}
 
 			if runF != nil {
@@ -109,12 +105,13 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	cmd.Flags().StringVarP(&opts.HeadBranch, "head", "H", "", "Filter by head branch")
 	cmd.Flags().StringSliceVarP(&opts.Labels, "label", "l", nil, "Filter by label")
 	cmd.Flags().StringVarP(&opts.Author, "author", "A", "", "Filter by author")
-	cmd.Flags().StringVar(&opts.AppAuthor, "app", "", "Filter by GitHub App author")
+	cmd.Flags().StringVar(&appAuthor, "app", "", "Filter by GitHub App author")
 	cmd.Flags().StringVarP(&opts.Assignee, "assignee", "a", "", "Filter by assignee")
 	cmd.Flags().StringVarP(&opts.Search, "search", "S", "", "Search pull requests with `query`")
-	cmd.Flags().BoolVarP(&draft, "draft", "d", false, "Filter by draft state")
-
+	cmdutil.NilBoolFlag(cmd, &opts.Draft, "draft", "d", "Filter by draft state")
 	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.PullRequestFields)
+
+	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "base", "head")
 
 	return cmd
 }
@@ -128,6 +125,7 @@ var defaultFields = []string{
 	"headRepositoryOwner",
 	"isCrossRepository",
 	"isDraft",
+	"createdAt",
 }
 
 func listRun(opts *ListOptions) error {
@@ -169,18 +167,17 @@ func listRun(opts *ListOptions) error {
 		}
 
 		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
+			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", text.DisplayURL(openURL))
 		}
 		return opts.Browser.Browse(openURL)
-	}
-
-	if opts.AppAuthor != "" {
-		filters.Author = fmt.Sprintf("app/%s", opts.AppAuthor)
 	}
 
 	listResult, err := listPullRequests(httpClient, baseRepo, filters, opts.LimitResults)
 	if err != nil {
 		return err
+	}
+	if len(listResult.PullRequests) == 0 && opts.Exporter == nil {
+		return shared.ListNoResults(ghrepo.FullName(baseRepo), "pull request", !filters.IsDefault())
 	}
 
 	err = opts.IO.StartPager()
@@ -202,18 +199,32 @@ func listRun(opts *ListOptions) error {
 	}
 
 	cs := opts.IO.ColorScheme()
-	table := utils.NewTablePrinter(opts.IO)
+	isTTY := opts.IO.IsStdoutTTY()
+
+	headers := []string{
+		"ID",
+		"TITLE",
+		"BRANCH",
+	}
+	if !isTTY {
+		headers = append(headers, "STATE")
+	}
+	headers = append(headers, "CREATED AT")
+
+	table := tableprinter.New(opts.IO, tableprinter.WithHeader(headers...))
 	for _, pr := range listResult.PullRequests {
 		prNum := strconv.Itoa(pr.Number)
-		if table.IsTTY() {
+		if isTTY {
 			prNum = "#" + prNum
 		}
-		table.AddField(prNum, nil, cs.ColorFromString(shared.ColorForPR(pr)))
-		table.AddField(text.ReplaceExcessiveWhitespace(pr.Title), nil, nil)
-		table.AddField(pr.HeadLabel(), nil, cs.Cyan)
-		if !table.IsTTY() {
-			table.AddField(prStateWithDraft(&pr), nil, nil)
+
+		table.AddField(prNum, tableprinter.WithColor(cs.ColorFromString(shared.ColorForPRState(pr))))
+		table.AddField(text.RemoveExcessiveWhitespace(pr.Title))
+		table.AddField(pr.HeadLabel(), tableprinter.WithColor(cs.Cyan))
+		if !isTTY {
+			table.AddField(prStateWithDraft(&pr))
 		}
+		table.AddTimeField(opts.Now(), pr.CreatedAt, cs.Gray)
 		table.EndRow()
 	}
 	err = table.Render()
