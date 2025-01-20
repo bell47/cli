@@ -10,26 +10,23 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/browser"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/cli/cli/v2/pkg/markdown"
-	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
-
-type browser interface {
-	Browse(string) error
-}
 
 type ViewOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
-	Browser    browser
+	Browser    browser.Browser
 	Exporter   cmdutil.Exporter
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 
 	RepoArg string
 	Web     bool
@@ -48,13 +45,15 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	cmd := &cobra.Command{
 		Use:   "view [<repository>]",
 		Short: "View a repository",
-		Long: `Display the description and the README of a GitHub repository.
+		Long: heredoc.Docf(`
+			Display the description and the README of a GitHub repository.
 
-With no argument, the repository for the current directory is displayed.
+			With no argument, the repository for the current directory is displayed.
 
-With '--web', open the repository in a web browser instead.
+			With %[1]s--web%[1]s, open the repository in a web browser instead.
 
-With '--branch', view a specific branch of the repository.`,
+			With %[1]s--branch%[1]s, view a specific branch of the repository.
+		`, "`"),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -70,6 +69,8 @@ With '--branch', view a specific branch of the repository.`,
 	cmd.Flags().BoolVarP(&opts.Web, "web", "w", false, "Open a repository in the browser")
 	cmd.Flags().StringVarP(&opts.Branch, "branch", "b", "", "View a specific branch of the repository")
 	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.RepositoryFields)
+
+	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "branch")
 
 	return cmd
 }
@@ -97,11 +98,7 @@ func viewRun(opts *ViewOptions) error {
 			if err != nil {
 				return err
 			}
-			hostname, err := cfg.DefaultHost()
-			if err != nil {
-				return err
-			}
-
+			hostname, _ := cfg.Authentication().DefaultHost()
 			currentUser, err := api.CurrentLoginName(apiClient, hostname)
 			if err != nil {
 				return err
@@ -135,7 +132,7 @@ func viewRun(opts *ViewOptions) error {
 	openURL := generateBranchURL(toView, opts.Branch)
 	if opts.Web {
 		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
+			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", text.DisplayURL(openURL))
 		}
 		return opts.Browser.Browse(openURL)
 	}
@@ -187,7 +184,10 @@ func viewRun(opts *ViewOptions) error {
 		readmeContent = cs.Gray("This repository does not have a README")
 	} else if isMarkdownFile(readme.Filename) {
 		var err error
-		readmeContent, err = markdown.Render(readme.Content, markdown.WithIO(opts.IO), markdown.WithBaseURL(readme.BaseURL))
+		readmeContent, err = markdown.Render(readme.Content,
+			markdown.WithTheme(opts.IO.TerminalTheme()),
+			markdown.WithWrap(opts.IO.TerminalWidth()),
+			markdown.WithBaseURL(readme.BaseURL))
 		if err != nil {
 			return fmt.Errorf("error rendering markdown: %w", err)
 		}
